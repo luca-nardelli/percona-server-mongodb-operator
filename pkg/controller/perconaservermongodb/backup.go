@@ -29,17 +29,12 @@ func (r *ReconcilePerconaServerMongoDB) reconcileBackupTasks(cr *api.PerconaServ
 
 			err := setControllerReference(cr, cjob, r.scheme)
 			if err != nil {
-				return fmt.Errorf("set owner reference for backup task %s: %v", cjob.Name, err)
+				return errors.Wrap(err, "set owner reference for backup task "+cjob.Name)
 			}
 
-			err = r.client.Create(context.TODO(), cjob)
-			if err != nil && k8sErrors.IsAlreadyExists(err) {
-				err := r.client.Update(context.TODO(), cjob)
-				if err != nil {
-					return fmt.Errorf("update task %s: %v", task.Name, err)
-				}
-			} else if err != nil {
-				return fmt.Errorf("create task %s: %v", task.Name, err)
+			err = r.createOrUpdate(cjob)
+			if err != nil {
+				return errors.Wrap(err, "create or update backup job")
 			}
 		}
 	}
@@ -189,6 +184,24 @@ func (r *ReconcilePerconaServerMongoDB) isBackupRunning(cr *api.PerconaServerMon
 	return false, nil
 }
 
+func (r *ReconcilePerconaServerMongoDB) hasFullBackup(cr *api.PerconaServerMongoDB) (bool, error) {
+	backups := api.PerconaServerMongoDBBackupList{}
+	if err := r.client.List(context.TODO(), &backups, &client.ListOptions{Namespace: cr.Namespace}); err != nil {
+		if k8sErrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, errors.Wrap(err, "get backup list")
+	}
+
+	for _, b := range backups.Items {
+		if b.Status.State == api.BackupStateReady && b.Spec.PSMDBCluster == cr.Name {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
 func (r *ReconcilePerconaServerMongoDB) updatePITR(cr *api.PerconaServerMongoDB) error {
 	// pitr is disabled right before restore so it must not be re-enabled during restore
 	isRestoring, err := r.isRestoreRunning(cr)
@@ -196,7 +209,7 @@ func (r *ReconcilePerconaServerMongoDB) updatePITR(cr *api.PerconaServerMongoDB)
 		return errors.Wrap(err, "checking if restore running on pbm update")
 	}
 
-	if isRestoring {
+	if isRestoring || cr.Status.State != api.AppStateReady {
 		return nil
 	}
 
@@ -206,13 +219,27 @@ func (r *ReconcilePerconaServerMongoDB) updatePITR(cr *api.PerconaServerMongoDB)
 	}
 	defer pbm.Close()
 
-	enabled, err := pbm.C.GetConfigVar("pitr.enabled")
+	if cr.Spec.Backup.PITR.Enabled {
+		hasFullBackup, err := r.hasFullBackup(cr)
+		if err != nil {
+			return errors.Wrap(err, "check full backup")
+		}
+
+		if !hasFullBackup {
+			log.Info("Point-in-time recovery will work only with full backup. Please create one manually or wait for scheduled backup to be created (if configured).")
+			return nil
+		}
+	}
+
+	v, err := pbm.C.GetConfigVar("pitr.enabled")
 	if errors.Is(err, mongo.ErrNoDocuments) {
 		return nil
 	}
 	if err != nil {
 		return errors.Wrap(err, "failed to get current pitr status")
 	}
+
+	var enabled = v.(bool)
 
 	if enabled == cr.Spec.Backup.PITR.Enabled {
 		return nil

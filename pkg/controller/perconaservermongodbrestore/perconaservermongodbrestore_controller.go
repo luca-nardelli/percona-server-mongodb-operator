@@ -3,12 +3,12 @@ package perconaservermongodbrestore
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
-
-	"go.mongodb.org/mongo-driver/bson/primitive"
 
 	"github.com/percona/percona-backup-mongodb/pbm"
 	"github.com/pkg/errors"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
@@ -87,8 +87,8 @@ func (r *ReconcilePerconaServerMongoDBRestore) Reconcile(request reconcile.Reque
 	}
 
 	// Fetch the PerconaSMDBBackupRestore instance
-	instance := &psmdbv1.PerconaServerMongoDBRestore{}
-	err := r.client.Get(context.TODO(), request.NamespacedName, instance)
+	cr := &psmdbv1.PerconaServerMongoDBRestore{}
+	err := r.client.Get(context.TODO(), request.NamespacedName, cr)
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
 			// Request object not found, could have been deleted after reconcile request.
@@ -100,34 +100,15 @@ func (r *ReconcilePerconaServerMongoDBRestore) Reconcile(request reconcile.Reque
 		return rr, err
 	}
 
-	err = instance.CheckFields()
-	if err != nil {
-		return rr, fmt.Errorf("fields check: %v", err)
-	}
-
-	switch instance.Status.State {
-	case psmdbv1.RestoreStateReady, psmdbv1.RestoreStateError:
-		return rr, nil
-	}
-
-	err = r.reconcileRestore(instance)
-	if err != nil {
-		return rr, fmt.Errorf("reconcile: %v", err)
-	}
-
-	return rr, nil
-}
-
-func (r *ReconcilePerconaServerMongoDBRestore) reconcileRestore(cr *psmdbv1.PerconaServerMongoDBRestore) (err error) {
 	status := cr.Status
 
 	defer func() {
 		if err != nil {
 			status.State = psmdbv1.RestoreStateError
 			status.Error = err.Error()
-			log.Error(err, "failed to make restore", "name", cr.Name, "backup", cr.Spec.BackupName)
+			log.Error(err, "failed to make restore", "restore", cr.Name, "backup", cr.Spec.BackupName)
 		}
-		if cr.Status.State != status.State {
+		if cr.Status.State != status.State || cr.Status.Error != status.Error {
 			cr.Status = status
 			uerr := r.updateStatus(cr)
 			if uerr != nil {
@@ -136,37 +117,60 @@ func (r *ReconcilePerconaServerMongoDBRestore) reconcileRestore(cr *psmdbv1.Perc
 		}
 	}()
 
-	cluster := &psmdbv1.PerconaServerMongoDB{}
-	err = r.client.Get(context.TODO(), types.NamespacedName{Name: cr.Spec.ClusterName, Namespace: cr.Namespace}, cluster)
+	err = cr.CheckFields()
 	if err != nil {
-		return errors.Wrapf(err, "get cluster %s/%s", cr.Namespace, cr.Spec.ClusterName)
+		return rr, fmt.Errorf("fields check: %v", err)
 	}
 
-	cjobs, err := backup.HasActiveJobs(r.client, cluster, backup.NewRestoreJob(cr.Name), backup.NotPITRLock)
+	switch cr.Status.State {
+	case psmdbv1.RestoreStateReady, psmdbv1.RestoreStateError:
+		return rr, nil
+	}
+
+	status, err = r.reconcileRestore(cr)
 	if err != nil {
-		return errors.Wrap(err, "check for concurrent jobs")
+		return rr, fmt.Errorf("reconcile: %v", err)
+	}
+
+	return rr, nil
+}
+
+func (r *ReconcilePerconaServerMongoDBRestore) reconcileRestore(cr *psmdbv1.PerconaServerMongoDBRestore) (psmdbv1.PerconaServerMongoDBRestoreStatus, error) {
+	status := cr.Status
+
+	cluster := &psmdbv1.PerconaServerMongoDB{}
+	err := r.client.Get(context.TODO(), types.NamespacedName{Name: cr.Spec.ClusterName, Namespace: cr.Namespace}, cluster)
+	if err != nil {
+		return status, errors.Wrapf(err, "get cluster %s/%s", cr.Namespace, cr.Spec.ClusterName)
+	}
+
+	cjobs, err := backup.HasActiveJobs(r.client, cluster, backup.NewRestoreJob(cr), backup.NotPITRLock)
+	if err != nil {
+		return status, errors.Wrap(err, "check for concurrent jobs")
 	}
 	if cjobs {
 		if cr.Status.State != psmdbv1.RestoreStateWaiting {
 			log.Info("waiting to finish another backup/restore.")
 		}
 		status.State = psmdbv1.RestoreStateWaiting
-		return nil
+		return status, nil
 	}
 
-	bcpName := cr.Spec.BackupName
-	storageName := cr.Spec.StorageName
+	var (
+		backupName  = cr.Spec.BackupName
+		storageName = cr.Spec.StorageName
+	)
 
-	if bcpName == "" || storageName == "" {
+	if backupName == "" || storageName == "" {
 		bcp, err := r.getBackup(cr)
 		if err != nil {
-			return errors.Wrap(err, "get backup")
+			return status, errors.Wrap(err, "get backup")
 		}
 		if bcp.Status.State != psmdbv1.BackupStateReady {
-			return errors.New("backup is not ready")
+			return status, errors.New("backup is not ready")
 		}
 
-		bcpName = bcp.Status.PBMname
+		backupName = bcp.Status.PBMname
 		storageName = bcp.Spec.StorageName
 	}
 
@@ -174,14 +178,14 @@ func (r *ReconcilePerconaServerMongoDBRestore) reconcileRestore(cr *psmdbv1.Perc
 		mongos := appsv1.Deployment{}
 		err = r.client.Get(context.Background(), cluster.MongosNamespacedName(), &mongos)
 		if err != nil && !k8serrors.IsNotFound(err) {
-			return errors.Wrapf(err, "failed to get mongos")
+			return status, errors.Wrapf(err, "failed to get mongos")
 		}
 
 		if err == nil {
 			log.Info("waiting for mongos termination")
 
 			status.State = psmdbv1.RestoreStateWaiting
-			return nil
+			return status, nil
 		}
 	}
 
@@ -189,71 +193,71 @@ func (r *ReconcilePerconaServerMongoDBRestore) reconcileRestore(cr *psmdbv1.Perc
 	if errPBM != nil {
 		log.Info("Waiting for pbm-agent.")
 		status.State = psmdbv1.RestoreStateWaiting
-		return nil
+		return status, nil
 	}
 	defer pbmc.Close()
 
 	if status.State == psmdbv1.RestoreStateNew || status.State == psmdbv1.RestoreStateWaiting {
-		stg, ok := cluster.Spec.Backup.Storages[storageName]
-		if !ok {
-			return errors.Errorf("unable to get storage '%s'", cr.Spec.StorageName)
+		storage, err := r.getStorage(cr, cluster, storageName)
+		if err != nil {
+			return status, errors.Wrap(err, "get storage")
 		}
 
-		err := pbmc.SetConfig(stg, cluster.Spec.Backup.PITR.Disabled())
+		err = pbmc.SetConfig(storage, cluster.Spec.Backup.PITR.Disabled())
 		if err != nil {
-			return errors.Wrap(err, "set pbm config")
+			return status, errors.Wrap(err, "set pbm config")
 		}
 
 		isBlockedByPITR, err := pbmc.HasLocks(backup.IsPITRLock)
 		if err != nil {
-			return errors.Wrap(err, "checking pbm pitr locks")
+			return status, errors.Wrap(err, "checking pbm pitr locks")
 		}
 
 		if isBlockedByPITR {
 			log.Info("Waiting for PITR to be disabled.")
 			status.State = psmdbv1.RestoreStateWaiting
-			return nil
+			return status, nil
 		}
 
-		status.PBMname, err = runRestore(bcpName, pbmc)
+		status.PBMname, err = runRestore(backupName, pbmc, cr.Spec.PITR)
 		status.State = psmdbv1.RestoreStateRequested
-		return err
+		return status, err
 	}
 
 	meta, err := pbmc.C.GetRestoreMeta(cr.Status.PBMname)
 	if err != nil {
-		return errors.Wrap(err, "get pbm metadata")
+		return status, errors.Wrap(err, "get pbm metadata")
 	}
 
 	if meta == nil || meta.Name == "" {
 		log.Info("Waiting for restore metadata", "PBM name", cr.Status.PBMname, "restore", cr.Name, "backup", cr.Spec.BackupName)
-		return nil
+		return status, nil
 	}
 
 	switch meta.Status {
 	case pbm.StatusError:
 		status.State = psmdbv1.RestoreStateError
 		status.Error = meta.Error
-		if err = reEnablePITR(pbmc, cluster.Spec.Backup.PITR); err != nil {
-			return
+		if err = reEnablePITR(pbmc, cluster.Spec.Backup); err != nil {
+			return status, err
 		}
 	case pbm.StatusDone:
 		status.State = psmdbv1.RestoreStateReady
 		status.CompletedAt = &metav1.Time{
 			Time: time.Unix(meta.LastTransitionTS, 0),
 		}
-		if err = reEnablePITR(pbmc, cluster.Spec.Backup.PITR); err != nil {
-			return
+		if err = reEnablePITR(pbmc, cluster.Spec.Backup); err != nil {
+			return status, err
 		}
 	case pbm.StatusStarting, pbm.StatusRunning:
 		status.State = psmdbv1.RestoreStateRunning
 	}
 
-	return nil
+	return status, nil
 }
 
-func reEnablePITR(pbm *backup.PBM, pitr psmdbv1.PITRSpec) (err error) {
-	if !pitr.Enabled {
+func reEnablePITR(pbm *backup.PBM, backup psmdbv1.BackupSpec) (err error) {
+	if !backup.IsEnabledPITR() {
 		return
 	}
 
@@ -265,29 +269,103 @@ func reEnablePITR(pbm *backup.PBM, pitr psmdbv1.PITRSpec) (err error) {
 	return
 }
 
-func runRestore(backup string, pbmc *backup.PBM) (string, error) {
+func runRestore(backup string, pbmc *backup.PBM, pitr *psmdbv1.PITRestoreSpec) (string, error) {
 	e := pbmc.C.Logger().NewEvent(string(pbm.CmdResyncBackupList), "", "", primitive.Timestamp{})
 	err := pbmc.C.ResyncStorage(e)
 	if err != nil {
 		return "", errors.Wrap(err, "set resync backup list from the store")
 	}
 
-	rName := time.Now().UTC().Format(time.RFC3339Nano)
-	err = pbmc.C.SendCmd(pbm.Cmd{
-		Cmd: pbm.CmdRestore,
-		Restore: pbm.RestoreCmd{
-			Name:       rName,
-			BackupName: backup,
-		},
-	})
-	if err != nil {
+	var (
+		cmd   pbm.Cmd
+		rName = time.Now().UTC().Format(time.RFC3339Nano)
+	)
+
+	switch {
+	case pitr == nil:
+		cmd = pbm.Cmd{
+			Cmd: pbm.CmdRestore,
+			Restore: pbm.RestoreCmd{
+				Name:       rName,
+				BackupName: backup,
+			},
+		}
+	case pitr.Type == psmdbv1.PITRestoreTypeDate:
+		var ts = pitr.Date.Unix()
+
+		if _, err := pbmc.GetPITRChunkContains(ts); err != nil {
+			return "", err
+		}
+
+		cmd = pbm.Cmd{
+			Cmd: pbm.CmdPITRestore,
+			PITRestore: pbm.PITRestoreCmd{
+				Name: rName,
+				TS:   ts,
+			},
+		}
+	case pitr.Type == psmdbv1.PITRestoreTypeLatest:
+		tl, err := pbmc.GetLatestTimelinePITR()
+		if err != nil {
+			return "", err
+		}
+
+		cmd = pbm.Cmd{
+			Cmd: pbm.CmdPITRestore,
+			PITRestore: pbm.PITRestoreCmd{
+				Name: rName,
+				TS:   int64(tl.End),
+			},
+		}
+	}
+
+	if err = pbmc.C.SendCmd(cmd); err != nil {
 		return "", errors.Wrap(err, "send restore cmd")
 	}
 
 	return rName, nil
 }
 
+func (r *ReconcilePerconaServerMongoDBRestore) getStorage(cr *psmdbv1.PerconaServerMongoDBRestore, cluster *psmdbv1.PerconaServerMongoDB, storageName string) (psmdbv1.BackupStorageSpec, error) {
+	if len(storageName) > 0 {
+		storage, ok := cluster.Spec.Backup.Storages[storageName]
+		if !ok {
+			return psmdbv1.BackupStorageSpec{}, errors.Errorf("unable to get storage '%s'", storageName)
+		}
+		return storage, nil
+	}
+
+	return psmdbv1.BackupStorageSpec{
+		Type: psmdbv1.BackupStorageS3,
+		S3:   *cr.Spec.BackupSource.S3,
+	}, nil
+}
+
 func (r *ReconcilePerconaServerMongoDBRestore) getBackup(cr *psmdbv1.PerconaServerMongoDBRestore) (*psmdbv1.PerconaServerMongoDBBackup, error) {
+	if len(cr.Spec.BackupName) == 0 && cr.Spec.BackupSource != nil {
+		s := strings.Split(cr.Spec.BackupSource.Destination, "/")
+		backupName := s[len(s)-1]
+
+		return &psmdbv1.PerconaServerMongoDBBackup{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        cr.Name,
+				Namespace:   cr.Namespace,
+				ClusterName: cr.ClusterName,
+			},
+			Spec: psmdbv1.PerconaServerMongoDBBackupSpec{
+				PSMDBCluster: cr.Spec.ClusterName,
+				StorageName:  cr.Spec.StorageName,
+			},
+			Status: psmdbv1.PerconaServerMongoDBBackupStatus{
+				State:       psmdbv1.BackupStateReady,
+				Destination: cr.Spec.BackupSource.Destination,
+				StorageName: cr.Spec.StorageName,
+				S3:          cr.Spec.BackupSource.S3,
+				PBMname:     backupName,
+			},
+		}, nil
+	}
+
 	backup := &psmdbv1.PerconaServerMongoDBBackup{}
 	err := r.client.Get(context.TODO(), types.NamespacedName{
 		Name:      cr.Spec.BackupName,

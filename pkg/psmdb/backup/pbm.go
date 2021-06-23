@@ -4,8 +4,11 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/percona/percona-backup-mongodb/pbm/storage/s3"
+	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo"
 
 	"github.com/percona/percona-backup-mongodb/pbm"
 	"github.com/pkg/errors"
@@ -167,6 +170,8 @@ func NotJobLock(j Job) LockHeaderPredicate {
 			jobCommand = pbm.CmdBackup
 		case TypeRestore:
 			jobCommand = pbm.CmdRestore
+		case TypePITRestore:
+			jobCommand = pbm.CmdPITRestore
 		default:
 			return true
 		}
@@ -197,4 +202,84 @@ func (b *PBM) HasLocks(predicates ...LockHeaderPredicate) (bool, error) {
 	}
 
 	return false, nil
+}
+
+var errNoOplogsForPITR = errors.New("there is no oplogs that can cover the date/time or no oplogs at all")
+
+func (b *PBM) GetLastPITRChunk() (*pbm.PITRChunk, error) {
+	nodeInfo, err := b.C.GetNodeInfo()
+	if err != nil {
+		return nil, errors.Wrap(err, "getting node information")
+	}
+
+	c, err := b.C.PITRLastChunkMeta(nodeInfo.SetName)
+	if err != nil {
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			return nil, errNoOplogsForPITR
+		}
+		return nil, errors.Wrap(err, "getting last PITR chunk")
+	}
+
+	if c == nil {
+		return nil, errNoOplogsForPITR
+	}
+
+	return c, nil
+}
+
+func (b *PBM) GetTimelinesPITR() ([]pbm.Timeline, error) {
+	var (
+		now       = time.Now().UTC().Unix()
+		timelines [][]pbm.Timeline
+	)
+
+	shards, err := b.C.ClusterMembers(nil)
+	if err != nil {
+		return nil, errors.Wrap(err, "getting cluster members")
+	}
+
+	for _, s := range shards {
+		rsTimelines, err := b.C.PITRGetValidTimelines(s.RS, now, nil)
+		if err != nil {
+			return nil, errors.Wrapf(err, "getting timelines for %s", s.RS)
+		}
+
+		timelines = append(timelines, rsTimelines)
+	}
+
+	return pbm.MergeTimelines(timelines...), nil
+}
+
+func (b *PBM) GetLatestTimelinePITR() (pbm.Timeline, error) {
+	timelines, err := b.GetTimelinesPITR()
+	if err != nil {
+		return pbm.Timeline{}, err
+	}
+
+	if len(timelines) == 0 {
+		return pbm.Timeline{}, errNoOplogsForPITR
+	}
+
+	return timelines[len(timelines)-1], nil
+}
+
+func (b *PBM) GetPITRChunkContains(unixTS int64) (*pbm.PITRChunk, error) {
+	nodeInfo, err := b.C.GetNodeInfo()
+	if err != nil {
+		return nil, errors.Wrap(err, "getting node information")
+	}
+
+	c, err := b.C.PITRGetChunkContains(nodeInfo.SetName, primitive.Timestamp{T: uint32(unixTS)})
+	if err != nil {
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			return nil, errNoOplogsForPITR
+		}
+		return nil, errors.Wrap(err, "getting PITR chunk for ts")
+	}
+
+	if c == nil {
+		return nil, errNoOplogsForPITR
+	}
+
+	return c, nil
 }

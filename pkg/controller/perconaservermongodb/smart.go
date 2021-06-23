@@ -7,9 +7,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/percona/percona-server-mongodb-operator/pkg/psmdb/backup"
-
 	api "github.com/percona/percona-server-mongodb-operator/pkg/apis/psmdb/v1"
+	"github.com/percona/percona-server-mongodb-operator/pkg/psmdb/backup"
 	"github.com/percona/percona-server-mongodb-operator/pkg/psmdb/mongo"
 	"github.com/pkg/errors"
 	mgo "go.mongodb.org/mongo-driver/mongo"
@@ -73,6 +72,7 @@ func (r *ReconcilePerconaServerMongoDB) smartUpdate(cr *api.PerconaServerMongoDB
 	if err != nil {
 		return errors.Wrap(err, "failed to check active jobs")
 	}
+
 	if hasActiveJobs {
 		log.Info("can't start 'SmartUpdate': waiting for active jobs to be finished")
 		return nil
@@ -102,7 +102,7 @@ func (r *ReconcilePerconaServerMongoDB) smartUpdate(cr *api.PerconaServerMongoDB
 		return fmt.Errorf("get pod list: %v", err)
 	}
 
-	client, err := r.mongoClientWithRole(cr, replset.Name, replset.Expose.Enabled, list.Items, roleClusterAdmin)
+	client, err := r.mongoClientWithRole(cr, *replset, roleClusterAdmin)
 	if err != nil {
 		return fmt.Errorf("failed to get mongo client: %v", err)
 	}
@@ -152,8 +152,9 @@ func (r *ReconcilePerconaServerMongoDB) smartUpdate(cr *api.PerconaServerMongoDB
 		}
 	}
 
-	log.Info("doing step down...")
-	err = mongo.StepDown(context.TODO(), client)
+	forceStepDown := replset.Size == 1
+	log.Info("doing step down...", "force", forceStepDown)
+	err = mongo.StepDown(context.TODO(), client, forceStepDown)
 	if err != nil {
 		return errors.Wrap(err, "failed to do step down")
 	}
@@ -195,24 +196,29 @@ func (r *ReconcilePerconaServerMongoDB) applyNWait(cr *api.PerconaServerMongoDB,
 		log.Info(fmt.Sprintf("pod %s is already updated", pod.Name))
 	} else {
 		if err := r.client.Delete(context.TODO(), pod); err != nil {
-			return fmt.Errorf("failed to delete pod: %v", err)
+			return errors.Wrap(err, "delete pod")
 		}
 	}
 
-	if err := r.waitPodRestart(updateRevision, pod, waitLimit); err != nil {
-		return fmt.Errorf("failed to wait pod: %v", err)
+	if err := r.waitPodRestart(cr, updateRevision, pod, waitLimit); err != nil {
+		return errors.Wrap(err, "wait pod restart")
 	}
 
 	return nil
 }
 
-func (r *ReconcilePerconaServerMongoDB) waitPodRestart(updateRevision string, pod *corev1.Pod, waitLimit int) error {
+func (r *ReconcilePerconaServerMongoDB) waitPodRestart(cr *api.PerconaServerMongoDB, updateRevision string, pod *corev1.Pod, waitLimit int) error {
 	for i := 0; i < waitLimit; i++ {
 		time.Sleep(time.Second * 1)
 
 		err := r.client.Get(context.TODO(), types.NamespacedName{Name: pod.Name, Namespace: pod.Namespace}, pod)
 		if err != nil && !k8sErrors.IsNotFound(err) {
-			return err
+			return errors.Wrap(err, "get pod")
+		}
+
+		// We update status in every loop to not wait until the end of smart update
+		if err := r.updateStatus(cr, nil, api.AppStateInit); err != nil {
+			return errors.Wrap(err, "update status")
 		}
 
 		ready := false
@@ -228,7 +234,7 @@ func (r *ReconcilePerconaServerMongoDB) waitPodRestart(updateRevision string, po
 		}
 	}
 
-	return fmt.Errorf("reach pod wait limit")
+	return errors.New("reach pod wait limit")
 }
 
 func (r *ReconcilePerconaServerMongoDB) getPrimaryPod(client *mgo.Client) (string, error) {

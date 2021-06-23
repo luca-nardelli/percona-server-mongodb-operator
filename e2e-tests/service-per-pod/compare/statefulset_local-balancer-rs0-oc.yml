@@ -1,6 +1,7 @@
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
+  annotations: {}
   generation: 1
   labels:
     app.kubernetes.io/component: mongod
@@ -166,7 +167,7 @@ spec:
         - name: users-secret-file
           secret:
             defaultMode: 420
-            secretName: internal-balancer-users
+            secretName: internal-local-balancer-users
   updateStrategy:
     rollingUpdate:
       partition: 0
