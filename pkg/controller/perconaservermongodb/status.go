@@ -178,10 +178,13 @@ func (r *ReconcilePerconaServerMongoDB) updateStatus(cr *api.PerconaServerMongoD
 	cr.Status.Host = host
 
 	switch {
-	case replsetsStopping > 0 || cr.ObjectMeta.DeletionTimestamp != nil:
+	case replsetsStopping > 0 || (cr.Spec.Sharding.Enabled && cr.Status.Mongos.Status == api.AppStateStopping) || cr.ObjectMeta.DeletionTimestamp != nil:
 		cr.Status.State = api.AppStateStopping
 	case replsetsPaused == len(repls):
 		cr.Status.State = api.AppStatePaused
+		if cr.Spec.Sharding.Enabled && cr.Status.Mongos.Status != api.AppStatePaused {
+			cr.Status.State = api.AppStateStopping
+		}
 	case !inProgress && replsetsReady == len(repls) && clusterState == api.AppStateReady && cr.Status.Host != "":
 		cr.Status.State = api.AppStateReady
 		if cr.Spec.Sharding.Enabled && cr.Status.Mongos.Status != api.AppStateReady {
@@ -345,7 +348,7 @@ func (r *ReconcilePerconaServerMongoDB) connectionEndpoint(cr *api.PerconaServer
 		}
 		addrs, err := psmdb.GetReplsetAddrs(r.client, cr, rs.Name, rs.Expose.Enabled, list.Items)
 		if err != nil {
-			return "", err
+			return "", errors.Wrap(err, "get replset addresses")
 		}
 		return strings.Join(addrs, ","), nil
 	}
